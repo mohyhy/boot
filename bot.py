@@ -33,7 +33,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_path = "image.jpg"
     await file.download_to_drive(file_path)
 
-    # حذف الصورة من الشات
     try:
         await context.bot.delete_message(
             chat_id=update.message.chat_id,
@@ -46,88 +45,136 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🔥 معالجة الصورة
     # =========================
     img = cv2.imread(file_path)
-
-    # تكبير الصورة
-    img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    img = cv2.resize(img, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
 
-    # تحسين
-    gray = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)[1]
+    thresh = cv2.adaptiveThreshold(
+        blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        11, 2
+    )
 
-    cv2.imwrite("processed.jpg", gray)
-
-    # =========================
-    # 🔍 OCR
-    # =========================
-    with open("processed.jpg", 'rb') as f:
-        response = requests.post(
-            'https://api.ocr.space/parse/image',
-            files={'file': f},
-            data={
-                'apikey': API_KEY,
-                'isOverlayRequired': True
-            }
-        )
-
-    result = response.json()
-
-    # استخراج النص
-    if "ParsedResults" in result and result["ParsedResults"]:
-        text = result["ParsedResults"][0]["ParsedText"]
-    else:
-        text = ""
-
-    os.remove("processed.jpg")
-    os.remove(file_path)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+    thresh = cv2.dilate(thresh, kernel, iterations=1)
 
     # =========================
-    # 🧠 استخراج الأرقام
+    # 🧠 كشف البطاقات
     # =========================
-    numbers = re.findall(r'\d+', text)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # فلترة (4 أو 6 أرقام فقط)
-    numbers = [n for n in numbers if len(n) in [4, 6]]
+    cards = []
 
-    print("NUMBERS:", numbers)
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
 
-    # =========================
-    # 🔥 الربط الصحيح (بدون خطأ)
-    # =========================
+        if 250 < w < 2000 and 100 < h < 1000:
+            crop = img[y:y+h, x:x+w]
+            cards.append((y, x, crop))
+
+    cards.sort(key=lambda c: (c[0], c[1]))
+
+    print("Detected cards:", len(cards))
+
     found_cards = []
 
-    i = 0
-    while i < len(numbers) - 1:
-        a = numbers[i]
-        b = numbers[i + 1]
+    # =========================
+    # 🔍 تحليل كل بطاقة
+    # =========================
+    if len(cards) >= 1:
 
-        if len(a) == 6 and len(b) == 4:
-            found_cards.append(f"{a}:{b}")
-            i += 2
+        for i, (_, _, card_img) in enumerate(cards):
 
-        elif len(b) == 6 and len(a) == 4:
-            found_cards.append(f"{b}:{a}")
-            i += 2
+            path = f"card_{i}.jpg"
+            cv2.imwrite(path, card_img)
 
-        else:
-            i += 1
+            with open(path, 'rb') as f:
+                response = requests.post(
+                    'https://api.ocr.space/parse/image',
+                    files={'file': f},
+                    data={'apikey': API_KEY}
+                )
 
-    print("CARDS:", found_cards)
+            result = response.json()
+
+            try:
+                text = result['ParsedResults'][0]['ParsedText']
+            except:
+                text = ""
+
+            numbers = re.findall(r'\d+', text)
+
+            user = None
+            password = None
+
+            for n in numbers:
+                if len(n) == 6:
+                    user = n
+                elif len(n) == 4:
+                    password = n
+
+            if user and password:
+                found_cards.append(f"{user}:{password}")
+
+            os.remove(path)
+
+    # =========================
+    # 🔁 fallback (في حال فشل الكشف)
+    # =========================
+    if not found_cards:
+
+        print("Fallback mode activated")
+
+        with open(file_path, 'rb') as f:
+            response = requests.post(
+                'https://api.ocr.space/parse/image',
+                files={'file': f},
+                data={'apikey': API_KEY}
+            )
+
+        result = response.json()
+
+        try:
+            text = result['ParsedResults'][0]['ParsedText']
+        except:
+            text = ""
+
+        numbers = re.findall(r'\d+', text)
+        numbers = [n for n in numbers if len(n) in [4,6]]
+
+        i = 0
+        while i < len(numbers) - 1:
+            a = numbers[i]
+            b = numbers[i + 1]
+
+            if len(a) == 6 and len(b) == 4:
+                found_cards.append(f"{a}:{b}")
+                i += 2
+            elif len(b) == 6 and len(a) == 4:
+                found_cards.append(f"{b}:{a}")
+                i += 2
+            else:
+                i += 1
+
+    os.remove(file_path)
 
     # =========================
     # 📩 إرسال النتائج
     # =========================
     if not found_cards:
-        await update.message.reply_text("❌ لم يتم التعرف على أي بطاقات")
+        await update.message.reply_text("❌ لم يتم التعرف على بطاقات")
         return
 
-    for card in found_cards:
+    for card in set(found_cards):
         user, password = card.split(":")
 
         text_msg = f"""
-{user}
-{password}
-
+━━━━━━━━━━━━━━
+👤 USER: {user}
+🔒 PASS: {password}
+━━━━━━━━━━━━━━
 """
 
         keyboard = InlineKeyboardMarkup([
@@ -162,7 +209,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def delete_later(context, chat_id, message_id):
     await asyncio.sleep(43200)
-#43200
+
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except:
@@ -177,5 +224,5 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(CallbackQueryHandler(handle_buttons))
 
-print("🤖 البوت يعمل بشكل صحيح 100%...")
+print("🤖 يعمل بأقوى نسخة حالياً...")
 app.run_polling()
